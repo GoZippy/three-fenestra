@@ -1,6 +1,6 @@
 {
   "name": "three-fenestra",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Three.js plugin: interior mapping shader with optional PBR front layer. Drop-in MeshStandardMaterial subclass usable in vanilla Three.js and React Three Fiber.",
   "author": "Edgar Pérez <codedgar.dev@gmail.com> (https://github.com/codedgar)",
   "license": "MIT",
@@ -31,6 +31,8 @@
   ],
   "scripts": {
     "dev": "vite",
+    "dev:instanced": "vite examples/instanced",
+    "dev:minimal": "vite examples/minimal",
     "build": "vite build && tsc -p tsconfig.build.json",
     "build:demo": "vite build --mode demo && node scripts/copy-demo-assets.mjs",
     "typecheck": "tsc --noEmit",
@@ -41,6 +43,7 @@
   },
   "devDependencies": {
     "@types/three": "^0.160.0",
+    "opentype.js": "^2.0.0",
     "playwright": "^1.60.0",
     "three": "^0.160.0",
     "typescript": "^5.4.0",

@@ -9,6 +9,13 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { Pane } from 'tweakpane';
 import { InteriorMappingMaterial } from 'three-fenestra';
 
+// Per-window emissive variation (v0.3.0). Warm/cool tones and cool-chance stay
+// constant; the palette drives litRatio / dim / brightness so the building goes
+// from "rooms evenly lit by day" to "scattered windows switched on at night".
+const VAR_WARM = new THREE.Color(1.7, 1.35, 0.95);  // incandescent
+const VAR_COOL = new THREE.Color(0.9, 1.15, 1.5);   // fluorescent / TV
+const VAR_COOL_CHANCE = 0.22;
+
 type WindowDef = {
   center: [number, number, number];
   right:  [number, number, number];
@@ -26,6 +33,8 @@ type WindowDef = {
 const _params = new URLSearchParams(location.search);
 const PARAM_NIGHT  = _params.get('night')  === '1';
 const PARAM_HIDEUI = _params.get('hideUi') === '1';
+const PARAM_LIGHTS = _params.has('lights') ? _params.get('lights') !== '0' : null; // force window-lights on/off
+const PARAM_LOD    = _params.has('lod') ? Math.max(0, Math.min(1, parseFloat(_params.get('lod')!))) : null;
 const PARAM_CAM_T  = _params.has('camT') ? Math.max(0, Math.min(1, parseFloat(_params.get('camT')!))) : null;
 
 if (PARAM_HIDEUI) {
@@ -156,6 +165,13 @@ type Palette = {
   frontTransmission: number;
   frontAlphaBoost: number;
   bloom: { strength: number; radius: number; threshold: number };
+  // Per-window emissive variation (v0.3.0). litRatio 0 ⇒ every window returns
+  // `varDim` (a uniform look, matching the pre-variation day appearance); as it
+  // climbs toward night, more windows switch on at `varBright` brightness.
+  varLitRatio: number;
+  varDim: THREE.Color;
+  varBrightMin: number;
+  varBrightRange: number;
 };
 
 const dayPalette: Palette = {
@@ -169,6 +185,11 @@ const dayPalette: Palette = {
   frontTransmission: 0.18,
   frontAlphaBoost:   1.15,
   bloom: { strength: 0.18, radius: 0.45, threshold: 0.95 },
+  // Day: litRatio 0 ⇒ all windows show the dim room (≈ the old flat day look),
+  // so daylight reads as evenly-lit interiors, not a wall of switched-on lamps.
+  varLitRatio: 0.0,
+  varDim: new THREE.Color(0.72, 0.72, 0.72),
+  varBrightMin: 0.3, varBrightRange: 0.35,
 };
 
 const nightPalette: Palette = {
@@ -182,6 +203,12 @@ const nightPalette: Palette = {
   frontTransmission: 0.08,
   frontAlphaBoost:   1.30,
   bloom: { strength: 0.45, radius: 0.55, threshold: 0.70 },
+  // Night: ~half the windows lit, the rest near-black; lit ones run bright
+  // enough to clear the bloom threshold and glow. This is the moment the
+  // variation feature sells itself.
+  varLitRatio: 0.5,
+  varDim: new THREE.Color(0.03, 0.04, 0.06),
+  varBrightMin: 0.8, varBrightRange: 1.7,
 };
 
 const livePalette: Palette = clonePalette(dayPalette);
@@ -198,6 +225,10 @@ function clonePalette(p: Palette): Palette {
     frontTransmission: p.frontTransmission,
     frontAlphaBoost:   p.frontAlphaBoost,
     bloom: { ...p.bloom },
+    varLitRatio: p.varLitRatio,
+    varDim: p.varDim.clone(),
+    varBrightMin: p.varBrightMin,
+    varBrightRange: p.varBrightRange,
   };
 }
 
@@ -221,6 +252,10 @@ function lerpPalette(out: Palette, a: Palette, b: Palette, t: number): void {
   out.bloom.strength  = THREE.MathUtils.lerp(a.bloom.strength,  b.bloom.strength,  t);
   out.bloom.radius    = THREE.MathUtils.lerp(a.bloom.radius,    b.bloom.radius,    t);
   out.bloom.threshold = THREE.MathUtils.lerp(a.bloom.threshold, b.bloom.threshold, t);
+  out.varLitRatio = THREE.MathUtils.lerp(a.varLitRatio, b.varLitRatio, t);
+  out.varDim.copy(a.varDim).lerp(b.varDim, t);
+  out.varBrightMin   = THREE.MathUtils.lerp(a.varBrightMin,   b.varBrightMin,   t);
+  out.varBrightRange = THREE.MathUtils.lerp(a.varBrightRange, b.varBrightRange, t);
 }
 
 function applyPalette(p: Palette): void {
@@ -250,6 +285,14 @@ function applyPalette(p: Palette): void {
     m.interiorEmissive  = p.interiorEmissive;
     m.frontTransmission = p.frontTransmission;
     m.frontAlphaBoost   = p.frontAlphaBoost;
+    // Per-window lights: push the palette-driven values, or fall back to the
+    // flat interiorEmissive above when the toggle is off.
+    m.setEmissiveVariation(sharedSettings.windowLights ? {
+      litRatio: p.varLitRatio,
+      warm: VAR_WARM, cool: VAR_COOL, coolChance: VAR_COOL_CHANCE,
+      brightMin: p.varBrightMin, brightRange: p.varBrightRange,
+      dim: p.varDim,
+    } : null);
   }
   bloom.strength  = p.bloom.strength;
   bloom.radius    = p.bloom.radius;
@@ -294,6 +337,9 @@ const sharedSettings = {
   glassDirtStrength: 0.09,
   glassFresnelStrength: 0.55,
   glassSmudgeStrength: 0.08,
+  // v0.3.0 showcase
+  windowLights: true, // GPU-side per-window emissive variation
+  lod: 1.0,           // 1 = full interior mapping, 0 = flat impostor
 };
 const materials: InteriorMappingMaterial[] = [];
 const buildingMaterials: THREE.MeshStandardMaterial[] = [];
@@ -313,6 +359,16 @@ function makeWindowMesh(w: WindowDef): THREE.Mesh {
     backScale: sharedSettings.backScale,
     planeSize: new THREE.Vector2(width, height),
     windowId: new THREE.Vector3(...w.center),
+    lod: sharedSettings.lod,
+    // Per-window emissive variation, seeded off windowId. Enabled here; the
+    // live values (litRatio/dim/brightness) are pushed every frame by
+    // applyPalette so the lights ramp up as the scene crosses into night.
+    emissiveVariation: sharedSettings.windowLights ? {
+      litRatio: livePalette.varLitRatio,
+      warm: VAR_WARM, cool: VAR_COOL, coolChance: VAR_COOL_CHANCE,
+      brightMin: livePalette.varBrightMin, brightRange: livePalette.varBrightRange,
+      dim: livePalette.varDim,
+    } : undefined,
     frontAtlas: sharedSettings.overlay ? overlayAtlas : undefined,
     frontAtlasCols: 4,
     frontAtlasRows: 4,
@@ -361,6 +417,7 @@ function applySharedSettingsToMaterials(): void {
     m.glassDirtStrength = sharedSettings.glassDirtStrength;
     m.glassFresnelStrength = sharedSettings.glassFresnelStrength;
     m.glassSmudgeStrength = sharedSettings.glassSmudgeStrength;
+    m.lod = sharedSettings.lod;
   }
 }
 
@@ -429,6 +486,16 @@ Promise.all([buildingP, windowsP]).then(([gltf, data]) => {
   const front = box.max.z + size.z * 0.05;
   streetA.position.set(buildingCenter.x - size.x * 0.35, baseY, front);
   streetB.position.set(buildingCenter.x + size.x * 0.35, baseY, front);
+
+  if (PARAM_LIGHTS !== null) {
+    sharedSettings.windowLights = PARAM_LIGHTS;
+    paneBindings.windowLights = PARAM_LIGHTS;
+  }
+  if (PARAM_LOD !== null) {
+    sharedSettings.lod = PARAM_LOD;
+    paneBindings.lod = PARAM_LOD;
+    applySharedSettingsToMaterials();
+  }
 
   applyPalette(livePalette);
   cinematic.ready = true;
@@ -678,6 +745,8 @@ const paneBindings = {
   glassDirtStrength: sharedSettings.glassDirtStrength,
   glassFresnelStrength: sharedSettings.glassFresnelStrength,
   glassSmudgeStrength:  sharedSettings.glassSmudgeStrength,
+  windowLights: sharedSettings.windowLights,
+  lod:          sharedSettings.lod,
   autoplay:  true,
   night:     false,
   exposure:  livePalette.exposure,
@@ -720,6 +789,10 @@ fMaterial.addBinding(paneBindings, 'glassFresnelStrength', { min: 0, max: 1.5, s
   .on('change', (e: any) => { sharedSettings.glassFresnelStrength = e.value; applySharedSettingsToMaterials(); });
 fMaterial.addBinding(paneBindings, 'glassSmudgeStrength', { min: 0, max: 1, step: 0.01, label: 'Smudges' })
   .on('change', (e: any) => { sharedSettings.glassSmudgeStrength = e.value; applySharedSettingsToMaterials(); });
+fMaterial.addBinding(paneBindings, 'windowLights', { label: 'Window lights' })
+  .on('change', (e: any) => { sharedSettings.windowLights = e.value; applyPalette(livePalette); });
+fMaterial.addBinding(paneBindings, 'lod', { min: 0, max: 1, step: 0.01, label: 'Detail (LOD)' })
+  .on('change', (e: any) => { sharedSettings.lod = e.value; applySharedSettingsToMaterials(); });
 
 const fScene = pane.addFolder({ title: 'Time of day', expanded: true });
 fScene.addBinding(paneBindings, 'autoplay', { label: 'Autoplay cycle' })
@@ -770,6 +843,10 @@ function copyPalette(out: Palette, src: Palette): void {
   out.bloom.strength = src.bloom.strength;
   out.bloom.radius   = src.bloom.radius;
   out.bloom.threshold= src.bloom.threshold;
+  out.varLitRatio = src.varLitRatio;
+  out.varDim.copy(src.varDim);
+  out.varBrightMin   = src.varBrightMin;
+  out.varBrightRange = src.varBrightRange;
 }
 
 // Push live values into the pane each frame (cheap; tweakpane diffs internally).

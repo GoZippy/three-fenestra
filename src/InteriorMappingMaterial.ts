@@ -16,6 +16,7 @@ type Shader = {
 };
 
 import {
+  glslCore,
   vertexCommon,
   vertexBody,
   fragmentCommon,
@@ -25,6 +26,31 @@ import {
   fragmentNormalReplacement,
   fragmentOutput,
 } from './shader/chunks.js';
+
+/**
+ * GPU-side per-window emissive variation derived from `windowId` — lit/unlit
+ * windows, warm/cool tones, brightness jitter. Because the decision happens in
+ * the shader from `windowId` alone (hash seeds: lit 3.71, tone 9.27,
+ * brightness 5.43), a far-LOD impostor shader can hash the same id with the
+ * same seeds and reproduce the exact same window, enabling seamless LOD
+ * crossfades. When set, this overrides `interiorEmissive`.
+ */
+export interface EmissiveVariation {
+  /** Chance a window is lit, in [0, 1]. Default 0.5. */
+  litRatio?: number;
+  /** Emissive tint of warm (incandescent) windows. Default (1.7, 1.35, 0.95). */
+  warm?: Color;
+  /** Emissive tint of cool (fluorescent/TV) windows. Default (0.9, 1.15, 1.5). */
+  cool?: Color;
+  /** Chance a lit window uses the cool tone. Default 0.22. */
+  coolChance?: number;
+  /** Minimum brightness multiplier of a lit window. Default 0.3. */
+  brightMin?: number;
+  /** Random brightness range added on top of brightMin. Default 0.35. */
+  brightRange?: number;
+  /** Emissive of unlit windows (faintly visible dark room). Default (0.07, 0.08, 0.1). */
+  dim?: Color;
+}
 
 export interface InteriorMappingMaterialParameters extends MeshStandardMaterialParameters {
   /** Interior atlas — the rooms texture sampled by the ray-march. */
@@ -39,8 +65,11 @@ export interface InteriorMappingMaterialParameters extends MeshStandardMaterialP
   backScale?: number;
   /** Plane size in world units (width, height). Must match the geometry. */
   planeSize: Vector2;
-  /** Per-window seed (typically the window center). Controls cell picking. */
-  windowId: Vector3;
+  /**
+   * Per-window seed (typically the window center). Controls cell picking.
+   * Optional in instanced mode, where `instanceWindowId` replaces it.
+   */
+  windowId?: Vector3;
   /**
    * Multiplier on the interior contribution before adding to the lit output.
    * Default (1, 1, 1). Tint warm + scale up for a "lights on" night look,
@@ -110,6 +139,29 @@ export interface InteriorMappingMaterialParameters extends MeshStandardMaterialP
    * Different from glassDirtStrength (which is roughness modulation). Default 0.0.
    */
   glassSmudgeStrength?: number;
+
+  /**
+   * Level-of-detail blend in [0, 1]. 1 = full interior mapping with all glass
+   * cues. 0 = flat impostor: the back cell is sampled straight onto the plane
+   * with no parallax, and fresnel/refraction/smudge/glass-thickness shut off —
+   * pixel-equivalent to a cheap facade shader sampling the same atlas cell.
+   * Drive by camera distance to crossfade against a far-LOD facade. Default 1.
+   */
+  lod?: number;
+
+  /** GPU-side per-window emissive variation (see {@link EmissiveVariation}). */
+  emissiveVariation?: EmissiveVariation;
+
+  /**
+   * Instanced mode: use with a THREE.InstancedMesh whose geometry carries
+   * InstancedBufferAttributes `instanceWindowId` (vec3), `instanceLod`
+   * (float) and `instanceFade` (float). They replace the `windowId` / `lod`
+   * uniforms per window, and `instanceFade` scales the output alpha (set
+   * `transparent: true` to use it for LOD crossfades). One material +
+   * one InstancedMesh = thousands of windows in a single draw call.
+   * Default false.
+   */
+  instanced?: boolean;
 }
 
 type InteriorUniforms = {
@@ -137,6 +189,14 @@ type InteriorUniforms = {
   uGlassFresnelStrength: IUniform<number>;
   uGlassFresnelColor: IUniform<Color>;
   uGlassSmudgeStrength: IUniform<number>;
+  uLod: IUniform<number>;
+  uVarEnabled: IUniform<number>;
+  uVarLitRatio: IUniform<number>;
+  uVarWarm: IUniform<Color>;
+  uVarCool: IUniform<Color>;
+  uVarCoolChance: IUniform<number>;
+  uVarBright: IUniform<Vector2>;
+  uVarDim: IUniform<Color>;
 };
 
 export class InteriorMappingMaterial extends MeshStandardMaterial {
@@ -144,6 +204,8 @@ export class InteriorMappingMaterial extends MeshStandardMaterial {
 
   /** Custom uniforms — shared into the patched MeshStandardMaterial shader. */
   readonly interiorUniforms: InteriorUniforms;
+
+  private _instanced = false;
 
   constructor(params: InteriorMappingMaterialParameters) {
     const { backAtlas, planeSize, windowId, ...std } = params;
@@ -171,8 +233,14 @@ export class InteriorMappingMaterial extends MeshStandardMaterial {
     delete (stdParams as Record<string, unknown>).glassFresnelStrength;
     delete (stdParams as Record<string, unknown>).glassFresnelColor;
     delete (stdParams as Record<string, unknown>).glassSmudgeStrength;
+    delete (stdParams as Record<string, unknown>).lod;
+    delete (stdParams as Record<string, unknown>).emissiveVariation;
+    delete (stdParams as Record<string, unknown>).instanced;
 
     super(stdParams);
+
+    this._instanced = params.instanced ?? false;
+    const ev = params.emissiveVariation;
 
     this.interiorUniforms = {
       uBackAtlas:           { value: backAtlas },
@@ -181,7 +249,7 @@ export class InteriorMappingMaterial extends MeshStandardMaterial {
       uDepth:               { value: params.depth ?? 1.0 },
       uBackScale:           { value: params.backScale ?? 0.66 },
       uPlaneSize:           { value: planeSize.clone() },
-      uWindowId:            { value: windowId.clone() },
+      uWindowId:            { value: (windowId ?? new Vector3()).clone() },
       uInteriorEmissive:    { value: (params.interiorEmissive ?? new Color(1, 1, 1)).clone() },
       uFrontTransmission:   { value: params.frontTransmission ?? 0.25 },
       uFrontAlphaBoost:     { value: params.frontAlphaBoost ?? 1.0 },
@@ -199,6 +267,14 @@ export class InteriorMappingMaterial extends MeshStandardMaterial {
       uGlassFresnelStrength:{ value: params.glassFresnelStrength ?? 0.0 },
       uGlassFresnelColor:   { value: (params.glassFresnelColor ?? new Color(0.85, 0.92, 1.0)).clone() },
       uGlassSmudgeStrength: { value: params.glassSmudgeStrength ?? 0.0 },
+      uLod:                 { value: params.lod ?? 1.0 },
+      uVarEnabled:          { value: ev ? 1.0 : 0.0 },
+      uVarLitRatio:         { value: ev?.litRatio ?? 0.5 },
+      uVarWarm:             { value: (ev?.warm ?? new Color(1.7, 1.35, 0.95)).clone() },
+      uVarCool:             { value: (ev?.cool ?? new Color(0.9, 1.15, 1.5)).clone() },
+      uVarCoolChance:       { value: ev?.coolChance ?? 0.22 },
+      uVarBright:           { value: new Vector2(ev?.brightMin ?? 0.3, ev?.brightRange ?? 0.35) },
+      uVarDim:              { value: (ev?.dim ?? new Color(0.07, 0.08, 0.1)).clone() },
     };
 
     this.applyDefines();
@@ -207,6 +283,23 @@ export class InteriorMappingMaterial extends MeshStandardMaterial {
   /** Set/replace the interior atlas. */
   setBackAtlas(tex: Texture): void {
     this.interiorUniforms.uBackAtlas.value = tex;
+  }
+
+  /**
+   * Enable/update GPU-side per-window emissive variation, or pass null to
+   * disable and fall back to `interiorEmissive`.
+   */
+  setEmissiveVariation(ev: EmissiveVariation | null): void {
+    const u = this.interiorUniforms;
+    u.uVarEnabled.value = ev ? 1.0 : 0.0;
+    if (!ev) return;
+    if (ev.litRatio !== undefined) u.uVarLitRatio.value = ev.litRatio;
+    if (ev.warm) u.uVarWarm.value.copy(ev.warm);
+    if (ev.cool) u.uVarCool.value.copy(ev.cool);
+    if (ev.coolChance !== undefined) u.uVarCoolChance.value = ev.coolChance;
+    if (ev.brightMin !== undefined) u.uVarBright.value.x = ev.brightMin;
+    if (ev.brightRange !== undefined) u.uVarBright.value.y = ev.brightRange;
+    if (ev.dim) u.uVarDim.value.copy(ev.dim);
   }
 
   /** Set the front albedo atlas (RGBA). Pass null to remove. */
@@ -251,6 +344,7 @@ export class InteriorMappingMaterial extends MeshStandardMaterial {
     toggle('HAS_FRONT_ROUGHNESS',!!u.uFrontRoughnessAtlas.value);
     toggle('HAS_FRONT_METALNESS',!!u.uFrontMetalnessAtlas.value);
     toggle('HAS_GLASS_DIRT',     !!u.uGlassDirtMap.value);
+    toggle('IM_INSTANCED',       this._instanced);
     this.needsUpdate = true;
   }
 
@@ -265,7 +359,7 @@ export class InteriorMappingMaterial extends MeshStandardMaterial {
       );
 
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\n${fragmentCommon}`)
+      .replace('#include <common>', `#include <common>\n${glslCore}\n${fragmentCommon}`)
       .replace('#include <map_fragment>', fragmentMapReplacement)
       .replace('#include <roughnessmap_fragment>', fragmentRoughnessReplacement)
       .replace('#include <metalnessmap_fragment>', fragmentMetalnessReplacement)
@@ -301,4 +395,6 @@ export class InteriorMappingMaterial extends MeshStandardMaterial {
   set glassFresnelColor(c: Color)  { this.interiorUniforms.uGlassFresnelColor.value.copy(c); }
   get glassSmudgeStrength(): number  { return this.interiorUniforms.uGlassSmudgeStrength.value; }
   set glassSmudgeStrength(v: number) { this.interiorUniforms.uGlassSmudgeStrength.value = v; }
+  get lod(): number  { return this.interiorUniforms.uLod.value; }
+  set lod(v: number) { this.interiorUniforms.uLod.value = v; }
 }

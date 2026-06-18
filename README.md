@@ -1,11 +1,12 @@
 # Three-Fenestra: an interior mapping shader for Three.js
 
-**Status:** v0.2.0, pre-1.0.
+**Status:** v0.3.0, pre-1.0.
 
 A `MeshStandardMaterial` subclass that adds parallax-based fake-3D rooms
 inside flat window planes, plus an optional PBR front layer for curtains,
 blinds, mullions, and glass dirt. Works in vanilla Three.js and React
-Three Fiber.
+Three Fiber. Scales from one window to a whole instanced facade in a single
+draw call.
 
 ![Three Fenestra: faux window interiors with interior mapping](assets/header-cinematic.webp)
 
@@ -28,9 +29,16 @@ core and stacks the modern bits on top:
 - A PBR front overlay with optional normal / roughness / metalness atlases
 - A transmission term so curtains can still bleed warm light at night
 - Uniforms wired for a day/night controller (you supply the controller)
+- GPU-side per-window lights — lit/unlit, warm/cool, brightness jitter, all
+  derived from a window seed with no per-window CPU work ([`emissiveVariation`](#per-window-lights-emissivevariation))
+- An [instanced mode](#instancing) so thousands of windows render from one
+  `InstancedMesh` and one material in a single draw call
+- A [LOD](#level-of-detail-lod) blend that collapses to a flat impostor at
+  distance, for crossfading against cheap far-LOD facades
 
-It is one material per window mesh. Drop it into any existing scene that
-already uses Three's standard lighting and it composites correctly.
+Drop it into any existing scene that already uses Three's standard lighting
+and it composites correctly — one material per window mesh, or one material
+for a whole instanced facade.
 
 ---
 
@@ -154,8 +162,11 @@ All `MeshStandardMaterialParameters` are accepted, plus:
 | `depth` | `number` | `1.0` | Apparent room depth, in plane-local units. |
 | `backScale` | `number` | `0.66` | Back-wall fill factor (0.05–0.999). |
 | `planeSize` | `Vector2` | **required** | Must match the geometry's width × height. |
-| `windowId` | `Vector3` | **required** | Per-window seed (typically the window center) for atlas cell picking. |
-| `interiorEmissive` | `Color` | `(1, 1, 1)` | Multiplier on the interior contribution before adding to the lit output. Use to tint warm and scale up for "lights on" night mode (e.g. `new Color(2, 1.5, 1)`). |
+| `windowId` | `Vector3` | **required**¹ | Per-window seed (typically the window center) for atlas cell picking. ¹Optional in [instanced mode](#instancing), where `instanceWindowId` replaces it. |
+| `interiorEmissive` | `Color` | `(1, 1, 1)` | Multiplier on the interior contribution before adding to the lit output. Use to tint warm and scale up for "lights on" night mode (e.g. `new Color(2, 1.5, 1)`). Overridden by [`emissiveVariation`](#per-window-lights-emissivevariation) when that is set. |
+| `emissiveVariation` | `EmissiveVariation?` | — | GPU-side per-window lights derived from `windowId`. See [Per-window lights](#per-window-lights-emissivevariation). |
+| `lod` | `number` | `1` | Level-of-detail blend in `[0, 1]`. `1` = full interior mapping + glass cues; `0` = flat impostor (no parallax/fresnel/refraction). See [LOD](#level-of-detail-lod). |
+| `instanced` | `boolean` | `false` | Enable [instanced mode](#instancing): per-window data comes from instanced attributes instead of uniforms. |
 | `frontAtlas` | `Texture?` | — | Front overlay atlas (RGBA: color + alpha). |
 | `frontAtlasCols`, `frontAtlasRows` | `number` | `1`, `1` | Front atlas grid. |
 | `frontNormalAtlas` | `Texture?` | — | Tangent-space normal map atlas. |
@@ -199,6 +210,13 @@ material.glassFresnelStrength = 0.5;
 material.glassFresnelColor    = new THREE.Color(0.85, 0.92, 1.0);  // copies into uniform
 material.glassSmudgeStrength  = 0.1;
 
+// LOD blend (1 = full detail, 0 = flat impostor)
+material.lod = 0.5;
+
+// Per-window lights — pass params to enable/update, or null to disable
+material.setEmissiveVariation({ litRatio: 0.6, brightMin: 0.5, brightRange: 0.8 });
+material.setEmissiveVariation(null);  // back to flat interiorEmissive
+
 // Texture swaps (pass null to disable)
 material.setBackAtlas(newAtlas);
 material.setFrontAtlas(tex, cols, rows);
@@ -239,6 +257,173 @@ For full "lights on at night," pair this with:
 
 The bundled `examples/asia-building` demo wires all three; check `main.ts`
 for a working reference.
+
+---
+
+## Per-window lights (`emissiveVariation`)
+
+Instead of one shared `interiorEmissive`, let the GPU give every window its
+own state — lit or unlit, warm or cool, dim or bright — derived entirely from
+`windowId`. No per-window CPU work, no per-window uniforms: the same seed
+always produces the same window, so a far-LOD impostor can reproduce it
+exactly.
+
+```ts
+const material = new InteriorMappingMaterial({
+  backAtlas: atlas,
+  planeSize,
+  windowId,
+  emissiveVariation: {
+    litRatio: 0.5,   // chance a window is lit
+    warm: new THREE.Color(1.7, 1.35, 0.95),  // incandescent tint
+    cool: new THREE.Color(0.9, 1.15, 1.5),   // fluorescent / TV tint
+    coolChance: 0.22,                         // chance a lit window is cool
+    brightMin: 0.3, brightRange: 0.35,        // lit brightness = min + range·rand
+    dim: new THREE.Color(0.07, 0.08, 0.1),   // unlit (faintly visible dark room)
+  },
+});
+
+// Update or disable at runtime (e.g. ramp litRatio toward night):
+material.setEmissiveVariation({ litRatio: 0.7 });
+material.setEmissiveVariation(null);  // fall back to flat interiorEmissive
+```
+
+All fields are optional and fall back to the defaults shown above. When
+`emissiveVariation` is set it **overrides** `interiorEmissive`. The hash seeds
+are part of the public contract (lit `3.71`, tone `9.27`, brightness `5.43`)
+so an external shader can reproduce identical windows from the same id.
+
+To crossfade smoothly from a flat daytime look into night without a pop, keep
+it enabled the whole time and drive `litRatio` from `0` (day — every window
+returns `dim`, i.e. a uniform look) up toward your night value. The
+`examples/asia-building` demo does exactly this.
+
+---
+
+## Level of detail (LOD)
+
+`lod` blends between full interior mapping and a flat impostor:
+
+- `lod = 1` — full parallax ray-march plus all glass cues (fresnel,
+  refraction, smudges, glass thickness).
+- `lod = 0` — the back atlas cell is sampled straight onto the plane with no
+  parallax and the glass cues shut off. Pixel-equivalent to a cheap facade
+  shader sampling the same cell.
+
+Drive it by camera distance to crossfade a near, full-detail material against
+a far, cheap one:
+
+```ts
+const d = camera.position.distanceTo(windowWorldPos);
+material.lod = THREE.MathUtils.clamp(1 - (d - near) / (far - near), 0, 1);
+```
+
+In instanced mode the per-instance `instanceLod` attribute replaces this, and
+`instanceFade` scales output alpha so you can crossfade whole LOD tiers (set
+`transparent: true`).
+
+---
+
+## Instancing
+
+For high window counts, `instanced: true` moves per-window data off uniforms
+and onto `InstancedBufferAttribute`s, so one `InstancedMesh` + one material
+draws thousands of windows in a single draw call.
+
+The geometry must carry three instanced attributes:
+
+| Attribute | Type | Replaces | Purpose |
+|---|---|---|---|
+| `instanceWindowId` | `vec3` | `windowId` | Per-window seed (cell pick + emissive variation). |
+| `instanceLod` | `float` | `lod` | Per-window LOD blend. |
+| `instanceFade` | `float` | — | Scales output alpha (set `transparent: true` for LOD crossfades). |
+
+```ts
+const geom = new THREE.PlaneGeometry(W, H);
+const ids = new Float32Array(count * 3);
+const lods = new Float32Array(count).fill(1);
+const fades = new Float32Array(count).fill(1);
+
+const mesh = new THREE.InstancedMesh(geom, material, count);
+for (let i = 0; i < count; i++) {
+  mesh.setMatrixAt(i, matrixForWindow(i));   // position/orient each window
+  ids.set([seedX(i), seedY(i), 0], i * 3);
+}
+geom.setAttribute('instanceWindowId', new THREE.InstancedBufferAttribute(ids, 3));
+geom.setAttribute('instanceLod',      new THREE.InstancedBufferAttribute(lods, 1));
+geom.setAttribute('instanceFade',     new THREE.InstancedBufferAttribute(fades, 1));
+
+const material = new InteriorMappingMaterial({
+  backAtlas: atlas, planeSize: new THREE.Vector2(W, H),
+  instanced: true,            // windowId is optional here
+  emissiveVariation: { litRatio: 0.5 },
+});
+```
+
+`instanced: true` must be paired with an actual `THREE.InstancedMesh` — the
+shader reads the `instanceMatrix` Three provides for instanced meshes. See
+`examples/instanced/main.ts` for a complete 640-window facade.
+
+---
+
+## Embedding the shader (`glslCore`)
+
+The interior-mapping math is also exported as a standalone, varying-free GLSL
+string for embedding into **arbitrary** materials (a building shell, a merged
+city mesh) via `onBeforeCompile` — not just the bundled plane material:
+
+```ts
+import { glslCore } from 'three-fenestra';
+
+myMaterial.onBeforeCompile = (shader) => {
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', `#include <common>\n${glslCore}`);
+  // now call imWindowEmissive(...), imRoomBoxUV(...), imAtlasUV(...), imHash(...)
+};
+```
+
+The functions (`imHash`, `imWindowEmissive`, `imAtlasUV`, `imRoomBoxUV`) take
+all their inputs as parameters, so you supply your own uniforms/varyings. This
+is what the bundled material itself delegates to — one implementation, every
+consumer.
+
+---
+
+## Extending
+
+The library ships **mechanism, not policy**. `InteriorMappingMaterial` works
+out of the box for the common case (windows on a mesh, day/night, glass). But
+anything scene-specific is left to you, because the right answer depends on
+your scene, not the material. What you get are composable building blocks:
+
+| You want… | The block | What you build on top |
+|---|---|---|
+| Interior mapping in a non-plane material | [`glslCore`](#embedding-the-shader-glslcore) | Inject into any shader via `onBeforeCompile`. |
+| Distance-based LOD | [`lod`](#level-of-detail-lod) / `instanceLod` / `instanceFade` | Your own `distance → lod` mapping and tier crossfade. |
+| A cheap far-LOD impostor that matches | the **seed contract** (below) | A flat shader that reproduces the same windows from the same id. |
+| City-scale facades | [`instanced`](#instancing) mode | Your own instance attribute streams / culling. |
+| GPU-driven day/night lights | [`emissiveVariation`](#per-window-lights-emissivevariation) | A controller that ramps `litRatio` over time. |
+
+There is deliberately no built-in LOD manager or impostor shader. LOD strategy
+(thresholds, tier count, crossfade vs. pop, how it hooks your camera and
+culling) is app-specific; baking it in would only fight real integrations.
+
+### Stability: the hash-seed contract
+
+Per-window appearance is derived entirely from the window seed by `imHash`,
+using these seed constants:
+
+| Aspect | Seed |
+|---|---|
+| Lit / unlit | `3.71` |
+| Warm / cool tone | `9.27` |
+| Brightness jitter | `5.43` |
+
+These are **public API**. A far-LOD impostor shader can hash the same
+`windowId` with the same seeds and reproduce the exact same window, which is
+what makes seamless LOD crossfades possible. Because downstream shaders may
+depend on them, **these values will not change without a major version bump**.
+Treat them as a stable contract, not an implementation detail.
 
 ---
 
@@ -341,12 +526,6 @@ ignore.
 
 - **No envmap / cubemap reflections** on the glass area. Would require
   fresnel-modulated env sampling.
-- **No refraction distortion.** A planned opt-in `refractionStrength`
-  (default `0`) would perturb the ray direction using the front normal map.
-- **One material per window mesh.** Each window carries its own
-  `windowId` / `planeSize` uniforms. For very high window counts, an
-  instanced-attribute variant (single material, per-instance attributes)
-  is on the radar.
 - **Pre-lit interior.** The atlas is treated as already-shaded photography;
   scene lights do not relight the interior. This is by design; relighting
   fake rooms would defeat the cost saving the technique exists for.
@@ -358,6 +537,8 @@ ignore.
 ```bash
 npm install
 npm run dev          # serves examples/asia-building on :5173
+npm run dev:instanced # serves examples/instanced (640-window facade)
+npm run dev:minimal  # serves examples/minimal (single window)
 npm run build        # produces dist/ (the publishable package)
 npm run build:demo   # produces dist-demo/ (static export of the demo)
 npm run typecheck
@@ -366,8 +547,12 @@ npm run typecheck
 ### Examples
 
 - `examples/asia-building/` — the full demo: 160 windows on a real building,
-  cinematic camera, day/night palette, glass dirt, PBR curtains. What
-  `npm run dev` serves and what powers the [live demo](https://three-fenestra.codedgar.com).
+  cinematic camera, day/night palette with per-window lights, glass dirt, PBR
+  curtains, LOD slider. What `npm run dev` serves and what powers the
+  [live demo](https://three-fenestra.codedgar.com).
+- `examples/instanced/` — a 640-window facade from one `InstancedMesh` and one
+  material in a single draw call, with per-window emissive variation. The
+  reference for [instanced mode](#instancing).
 - `examples/minimal/` — single window plane, ~60 lines. The shortest
   runnable example for understanding the API surface.
 
